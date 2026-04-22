@@ -7,7 +7,7 @@ Method: Projected Unit Credit (IAS 19)
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import date, datetime
+from datetime import date
 import io, os
 import openpyxl
 import plotly.graph_objects as go
@@ -25,88 +25,124 @@ DEFAULT_SALARY_GROWTH = 0.05
 # ──────────────────────────────────────────────────────────────
 
 def load_employees(path) -> pd.DataFrame:
-    """
-    Column layout (0-indexed) in the 'data' sheet:
-    0  – row seq     1  – first name   2  – last name
-    3  – gender      4  – date of birth 5  – employment start date
-    6  – monthly salary
-    7  – section 14 start date  (formula '=F...' → same as start date)
-    8  – section 14 percentage
-    9  – existing severance fund balance
-    10 – formula column (ignored)
-    11 – termination / departure date
-    14 – departure type (dismissal / resignation / retirement)
-    """
-    wb   = openpyxl.load_workbook(path, data_only=True)
-    ws   = wb.worksheets[0]
-    rows = list(ws.iter_rows(values_only=True))
+    # Read with pandas — handles both xlsx and CSV transparently, and returns
+    # all values as proper Python types (numbers stay numeric, dates are parsed).
+    df_raw = pd.read_excel(path, sheet_name=0, header=None)
 
     def to_date(v):
-        if isinstance(v, datetime): return v.date()
-        if isinstance(v, date):     return v
-        return None
+        if v is None or (isinstance(v, float) and np.isnan(v)): return None
+        try:
+            return pd.to_datetime(v).date()
+        except Exception:
+            return None
 
     records = []
-    for row in rows[2:]:                          # row 0 = totals, row 1 = headers
-        if all(v is None for v in row): continue
-        gender, dob, start, salary = row[3], row[4], row[5], row[6]
-        if gender not in ("M", "F") or not dob or not start or salary is None:
+    for _, row in df_raw.iloc[2:].iterrows():   # rows 0=totals, 1=headers
+        gender = str(row.iloc[3]).strip() if pd.notna(row.iloc[3]) else ""
+        if gender not in ("M", "F"):
             continue
 
-        # Section 14 – formula string means "starts on employment start date"
-        sec14_raw   = row[7]
-        sec14_start = (to_date(start)
-                       if isinstance(sec14_raw, str)
-                       else to_date(sec14_raw))
-        sec14_pct   = float(row[8]) / 100 if isinstance(row[8], (int, float)) else 0.0
-        fund        = float(row[9])        if isinstance(row[9],  (int, float)) else 0.0
-        end_date    = to_date(row[11])
-        remarks     = str(row[14]) if row[14] else ""
+        try:
+            salary = float(row.iloc[6]) if pd.notna(row.iloc[6]) else 0.0
+            pct_raw = _to_float(row.iloc[8])
+            if pct_raw is None or (isinstance(pct_raw, float) and np.isnan(pct_raw)):
+                sec14_pct = 0.0
+            elif pct_raw > 1.0:
+                sec14_pct = pct_raw / 100.0   # stored as whole number (e.g. 72 or 100)
+            else:
+                sec14_pct = pct_raw           # stored as fraction (e.g. 0.72 or 1.0)
+            fund = float(row.iloc[9]) if pd.notna(row.iloc[9]) else 0.0
+        except Exception:
+            salary, sec14_pct, fund = 0.0, 0.0, 0.0
+
+        if salary <= 0:
+            continue
+
+        start_date  = to_date(row.iloc[5])
+        sec14_raw   = row.iloc[7]
+        sec14_start = to_date(sec14_raw) if pd.notna(sec14_raw) else start_date
+        if sec14_start is None:
+            sec14_start = start_date
 
         records.append(dict(
-            first_name    = str(row[1] or ""),
-            last_name     = str(row[2] or ""),
+            first_name    = str(row.iloc[1]) if pd.notna(row.iloc[1]) else "",
+            last_name     = str(row.iloc[2]) if pd.notna(row.iloc[2]) else "",
             gender        = gender,
-            dob           = to_date(dob),
-            start_date    = to_date(start),
-            salary        = float(salary),
+            dob           = to_date(row.iloc[4]),
+            start_date    = start_date,
+            salary        = salary,
             sec14_pct     = sec14_pct,
             sec14_start   = sec14_start,
             existing_fund = fund,
-            end_date      = end_date,
-            departure_type= remarks,
+            end_date      = to_date(row.iloc[11]),
+            departure_type= str(row.iloc[14]) if pd.notna(row.iloc[14]) else "",
         ))
     return pd.DataFrame(records)
 
+
+def _to_float(v):
+    """Convert cell value (number or numeric string) to float, else None."""
+    if isinstance(v, (int, float)): return float(v)
+    try: return float(str(v).replace(",", "").strip())
+    except (ValueError, TypeError): return None
 
 def load_assumptions(path):
     wb   = openpyxl.load_workbook(path, data_only=True)
     ws   = wb.worksheets[1]
     rows = list(ws.iter_rows(values_only=True))
 
+    def to_rate(val):
+        """Normalise a rate that may be stored as fraction (0.05) or percent (5)."""
+        if val is None: return None
+        return val / 100.0 if val > 1.0 else val
+
     curve, turns, sg = {}, {}, DEFAULT_SALARY_GROWTH
     for row in rows[3:]:
         if not row: continue
-        yr, rt = row[1], row[2]
-        if isinstance(yr, (int, float)) and isinstance(rt, (int, float)):
-            curve[int(yr)] = float(rt)
-        ag, fr, rr = row[5], row[6], row[7]
-        if isinstance(ag, str) and "-" in ag and isinstance(fr, (int, float)):
-            turns[ag] = {"fire": float(fr), "resign": float(rr or 0)}
-        sg_val = row[10]
-        if isinstance(sg_val, (int, float)) and 0 < sg_val < 1:
-            sg = float(sg_val)
+        yr  = _to_float(row[1])
+        rt  = to_rate(_to_float(row[2]))
+        if yr is not None and rt is not None:
+            curve[int(yr)] = rt
+        ag  = row[5]
+        fr  = to_rate(_to_float(row[6]))
+        rr  = to_rate(_to_float(row[7]))
+        if isinstance(ag, str) and "-" in ag and fr is not None:
+            turns[ag] = {"fire": fr, "resign": rr or 0.0}
+        sg_val = to_rate(_to_float(row[10]))
+        if sg_val is not None and 0 < sg_val < 1:
+            sg = sg_val
     return curve, turns, sg
 
 
 def load_mortality(path) -> dict:
-    wb   = openpyxl.load_workbook(path, data_only=True)
     mort = {"M": {}, "F": {}}
+    base = os.path.dirname(os.path.abspath(path))
+
+    # Try two separate CSV files first (male / female)
+    csv_m = os.path.join(base, "mortality_male.csv")
+    csv_f = os.path.join(base, "mortality_female.csv")
+    if os.path.exists(csv_m) and os.path.exists(csv_f):
+        for gender, csv_path in [("M", csv_m), ("F", csv_f)]:
+            df = pd.read_csv(csv_path, header=None)
+            for _, row in df.iterrows():
+                age = _to_float(row.iloc[1])
+                q   = _to_float(row.iloc[5]) if len(row) > 5 else None
+                if age is not None and q is not None:
+                    mort[gender][int(age)] = q
+        return mort
+
+    # Fall back to a two-sheet xlsx
+    wb = openpyxl.load_workbook(path, data_only=True)
+    if len(wb.worksheets) < 2:
+        raise ValueError(
+            "mortality_table.xlsx must contain two sheets (males first, females second), "
+            "or place mortality_male.csv / mortality_female.csv alongside the workbook.")
     for gender, ws in zip(["M", "F"], wb.worksheets[:2]):
         for row in ws.iter_rows(values_only=True):
-            age, q = row[1], row[5]
-            if isinstance(age, (int, float)) and isinstance(q, (int, float)):
-                mort[gender][int(age)] = float(q)
+            age = _to_float(row[1])
+            q   = _to_float(row[5]) if len(row) > 5 else None
+            if age is not None and q is not None:
+                mort[gender][int(age)] = q
     return mort
 
 
@@ -133,12 +169,16 @@ def discount_factor(t, curve):
     if t <= 0: return 1.0
     max_y = max(curve)
     t_eff = min(t, max_y)
-    t_lo  = max(1, int(t_eff))
-    t_hi  = min(t_lo + 1, max_y)
-    r_lo  = curve.get(t_lo, curve[max_y])
-    r_hi  = curve.get(t_hi, curve[max_y])
-    r     = r_lo if t_eff <= 1 else r_lo + (t_eff - t_lo) * (r_hi - r_lo)
-    if t > max_y: r = curve[max_y]
+    if t_eff <= 1:
+        r = curve.get(1, curve[min(curve.keys())])
+    else:
+        t_lo = int(t_eff)
+        t_hi = min(t_lo + 1, max_y)
+        r_lo = curve.get(t_lo, curve[max_y])
+        r_hi = curve.get(t_hi, curve[max_y])
+        r    = r_lo + (t_eff - t_lo) * (r_hi - r_lo)
+    if t > max_y:
+        r = curve[max_y]
     return (1 + r) ** (-t)
 
 
@@ -149,82 +189,73 @@ def discount_factor(t, curve):
 def calculate_dbo(emp: dict, curve, turns, sg, mort):
     """
     Returns (gross_DBO, net_liability, detail_rows).
-
-    Benefit formula at exit in year t:
-        B(t) = Salary × (1+g)^t × Seniority_at_exit × (1 – Sec14%)
-
-    Decrements and employer obligations:
-      • Dismissal  → employer pays B(t)            [always]
-      • Resignation → fund releases (co. policy)  → employer pays B(t)
-                      only if Sec14% = 0 AND seniority ≥ 5 yrs
-      • Death       → employer pays B(t)            [always, to estate]
-      • Retirement  → employer pays B(W)            [end of projection]
-
-    Net liability = max(0, Gross DBO – Existing Fund)
+    IAS 19 Projected Unit Credit — prorated benefit formula.
     """
     gender = emp["gender"]; dob = emp["dob"]; start = emp["start_date"]
     salary = emp["salary"]; sec14 = emp["sec14_pct"]; fund = emp["existing_fund"]
 
-    W  = RETIREMENT_AGE.get(gender, 67)
-    x  = years_between(dob,   VALUATION_DATE)
-    v  = years_between(start, VALUATION_DATE)
-    n  = int(W - x)
+    W = RETIREMENT_AGE.get(gender, 67)
+    x = years_between(dob, VALUATION_DATE)
+    v = years_between(start, VALUATION_DATE)  # seniority at valuation date
+    n = int(W - x)
 
-    if n <= 0:          # already at/past retirement age
-        b   = salary * max(v, 0) * (1 - sec14)
+    if n <= 0:
+        b = salary * max(v, 0) * (1 - sec14)
         row = dict(year=0, age=round(x,1), seniority=round(v,2),
                    salary_proj=round(salary,2), lp=1.0,
                    q_dismissal=0.0, q_resign=0.0, q_death=0.0,
-                   benefit=round(b,2), disc_factor=1.0,
+                   benefit=round(b,2), disc_factor=1.0, prorate=1.0,
                    dbo_dismissal=0.0, dbo_resign=0.0,
                    dbo_death=0.0, dbo_retirement=round(b,2),
                    year_dbo=round(b,2), cum_dbo=round(b,2))
-        return round(b,2), round(max(0.0, b-fund),2), [row]
+        return round(b, 2), round(max(0.0, b - fund), 2), [row]
 
     lp, dbo, detail, cum = 1.0, 0.0, [], 0.0
 
     for t in range(1, n + 1):
         age_t    = int(x) + t - 1
-        sen_exit = v + t
+        sen_exit = v + t   # total seniority at projected exit
         sal_t    = salary * (1 + sg) ** t
-        benefit  = sal_t * sen_exit * (1 - sec14)
 
+        # א. Projected benefit — current seniority v (prorating embedded in formula)
+        benefit = sal_t * v * (1 - sec14)
+
+        # ב. Exit probabilities
         q_f, q_r = turnover_for_age(age_t, turns)
         q_d      = mortality_for_age(age_t, gender, mort)
-        q_sum    = q_f + q_r + q_d
-        if q_sum > 1.0:
-            s = 1.0 / q_sum; q_f *= s; q_r *= s; q_d *= s; q_sum = 1.0
 
+        # ג. Employer payment probability
+        q_pay = q_f + q_d                          # dismissal + death — always liable
+        if sec14 == 0 and (v + t) >= 5:
+            q_pay += q_r                           # resignation — only if no Sec14 & sen ≥ 5
+        q_pay_r = q_r if (sec14 == 0 and (v + t) >= 5) else 0.0
+
+        # ד. Present value
         disc_mid = discount_factor(t - 0.5, curve)
+        year_dbo = lp * q_pay * benefit * disc_mid
 
-        emp_fire   = benefit if sen_exit >= 1 else 0.0
-        emp_resign = benefit if (sec14 == 0 and sen_exit >= 5) else 0.0
-        emp_death  = benefit if sen_exit >= 1 else 0.0
-
-        yr_f = lp * q_f * emp_fire   * disc_mid
-        yr_r = lp * q_r * emp_resign * disc_mid
-        yr_d = lp * q_d * emp_death  * disc_mid
-        yr_ret = 0.0
-
+        # ה. Retirement (final year)
         if t == n:
-            lp_ret = lp * (1 - q_sum)
-            yr_ret = lp_ret * sal_t * sen_exit * (1 - sec14) * discount_factor(n, curve)
+            lp_ret    = lp * (1 - (q_f + q_r + q_d))
+            year_dbo += lp_ret * benefit * discount_factor(n, curve)
 
-        year_dbo = yr_f + yr_r + yr_d + yr_ret
         dbo += year_dbo; cum += year_dbo
 
         detail.append(dict(
-            year=t, age=age_t, seniority=round(sen_exit,2),
-            salary_proj=round(sal_t,2), lp=round(lp,5),
-            q_dismissal=round(q_f,4), q_resign=round(q_r,4), q_death=round(q_d,6),
-            benefit=round(benefit,2), disc_factor=round(disc_mid,5),
-            dbo_dismissal=round(yr_f,2), dbo_resign=round(yr_r,2),
-            dbo_death=round(yr_d,2), dbo_retirement=round(yr_ret,2),
-            year_dbo=round(year_dbo,2), cum_dbo=round(cum,2),
+            year=t, age=age_t, seniority=round(sen_exit, 2),
+            salary_proj=round(sal_t, 2), lp=round(lp, 5),
+            q_dismissal=round(q_f, 4), q_resign=round(q_r, 4), q_death=round(q_d, 6),
+            benefit=round(benefit, 2), disc_factor=round(disc_mid, 5),
+            prorate=round(v / sen_exit, 4),
+            dbo_dismissal=round(lp * q_f  * benefit * disc_mid, 2),
+            dbo_resign   =round(lp * q_pay_r * benefit * disc_mid, 2),
+            dbo_death    =round(lp * q_d  * benefit * disc_mid, 2),
+            dbo_retirement=round(year_dbo - lp * q_pay * benefit * disc_mid, 2),
+            year_dbo=round(year_dbo, 2), cum_dbo=round(cum, 2),
         ))
-        lp *= (1 - q_sum)
+        lp *= (1 - (q_f + q_r + q_d))
 
-    return round(dbo,2), round(max(0.0, dbo-fund),2), detail
+    return round(dbo, 2), round(max(0.0, dbo - fund), 2), detail
 
 
 # ──────────────────────────────────────────────────────────────
@@ -608,18 +639,30 @@ def main():
                     unsafe_allow_html=True)
 
         # Pick year 1 as the worked example
-        ex_yr  = VALUATION_DATE.year + 1
-        ex_sal = emp["salary"] * (1 + sg) ** 1
-        ex_sen = v + 1
-        ex_ben = ex_sal * ex_sen * (1 - emp["sec14_pct"])
+        ex_yr   = VALUATION_DATE.year + 1
+        ex_sal  = emp["salary"] * (1 + sg) ** 1
+        ex_sen  = v + 1
+        ex_sec14_start = emp.get("sec14_start") or emp["start_date"]
+        ex_vpre = max(0.0, years_between(emp["start_date"], ex_sec14_start))
+        ex_spre = min(ex_vpre, ex_sen)
+        ex_spost = max(0.0, ex_sen - ex_spre)
+        ex_ben  = ex_sal * (ex_spre + ex_spost * (1.0 - emp["sec14_pct"]))
+        ex_prorate = min(1.0, v / ex_sen) if ex_sen > 0 else 1.0
         q_f1, q_r1 = turnover_for_age(int(x), turns)
         q_d1       = mortality_for_age(int(x), emp["gender"], mort)
         q_tot1     = q_f1 + q_r1 + q_d1
         disc1      = discount_factor(0.5, curve)
-        ex_dbo     = 1.0 * (q_f1 + (q_r1 if emp["sec14_pct"]==0 and ex_sen>=5 else 0) + q_d1) * ex_ben * disc1
+        ex_fund1 = emp["existing_fund"] + (emp["sec14_pct"] * emp["salary"] * (1 + sg) * ((1 + sg) - 1) / sg if sg != 0 else emp["sec14_pct"] * emp["salary"] * 1)
+        ex_resign1 = max(ex_ben, ex_fund1) if ex_sen >= 5 else 0.0
+        ex_dbo     = 1.0 * (q_f1 * ex_ben + q_r1 * ex_resign1 + q_d1 * ex_ben) * disc1 * ex_prorate
 
-        sec14_note = (f"(1 − {emp['sec14_pct']*100:.0f}%) = {(1-emp['sec14_pct'])*100:.0f}%"
-                      if emp["sec14_pct"] > 0 else "no Section 14, full benefit")
+        if emp["sec14_pct"] > 0 and ex_vpre > 0:
+            sec14_note = (f"pre-Sec14 {ex_spre:.2f} yrs × 100% + "
+                          f"post-Sec14 {ex_spost:.2f} yrs × {(1-emp['sec14_pct'])*100:.0f}%")
+        elif emp["sec14_pct"] > 0:
+            sec14_note = f"all service under Sec14 → {(1-emp['sec14_pct'])*100:.0f}% employer share"
+        else:
+            sec14_note = "no Section 14, employer bears 100%"
 
         st.markdown(f"""
         <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;
@@ -634,17 +677,20 @@ def main():
           <p style="margin:0 0 .5rem"><strong>The formula applied to every projection year t:</strong></p>
           <div style="background:white;border-radius:8px;padding:.7rem 1rem;
                       font-family:monospace;color:#1e293b;margin-bottom:.8rem">
-            DBO(t) = P(employed at t) &times; Exit Rate(t) &times; Benefit(t) &times; Discount Factor(t)
+            DBO(t) = P(employed at t) &times; Exit Rate(t) &times; Benefit(t) &times; Discount Factor(t) &times; Prorate(t)
           </div>
 
           <p style="margin:0 0 .4rem;font-weight:700;color:#1e3a5f">
             Where for each year:
           </p>
           <ul style="margin:.2rem 0 .8rem 1.2rem;padding:0">
-            <li><strong>Benefit(t)</strong> = Projected Salary &times; Seniority at exit &times; (1 &minus; Section 14%)<br>
-                <span style="color:#64748b">= salary grows at {sg*100:.0f}% per year; seniority increases by 1 yr each year</span></li>
-            <li><strong>Exit Rate(t)</strong> = dismissal rate + resignation rate* + mortality rate<br>
-                <span style="color:#64748b">*resignation creates employer liability only if no Section 14 and seniority &ge; 5 yrs</span></li>
+            <li><strong>Benefit(t)</strong> = Projected Salary &times;
+                (pre-Sec14 years &times; 100% + post-Sec14 years &times; (1 &minus; Sec14%))<br>
+                <span style="color:#64748b">Salary grows at {sg*100:.0f}%/yr; pre/post split determined by Sec14 start date</span></li>
+            <li><strong>Prorate(t)</strong> = seniority at 31.12.24 &divide; seniority at exit in year t
+                &nbsp;<em>(IAS 19 §67 — only past-service obligation is recognised)</em></li>
+            <li><strong>Exit Rate(t)</strong> = dismissal + resignation* + mortality<br>
+                <span style="color:#64748b">*resignation creates employer liability of max(legal benefit, fund value) for seniority &ge; 5 yrs (company policy)</span></li>
             <li><strong>Discount Factor(t)</strong> = present value of ₪1 due in t years
                 (from the IAS 19 bond yield curve)</li>
             <li><strong>P(employed at t)</strong> = probability the employee has not left before year t</li>
@@ -665,15 +711,17 @@ def main():
                      f"₪{emp['salary']:,.0f} × (1 + {sg*100:.0f}%)¹ = ₪{ex_sal:,.0f}"),
                     ("Seniority at exit (end of 2025)",
                      f"{v:.2f} + 1 = {ex_sen:.2f} years"),
-                    ("Benefit if employee exits in 2025",
-                     f"₪{ex_sal:,.0f} × {ex_sen:.2f} yrs × {sec14_note} = ₪{ex_ben:,.0f}"),
+                    ("Benefit split (Sec14 basis)",
+                     sec14_note + f" → ₪{ex_ben:,.0f}"),
+                    ("Prorate — IAS 19 §67",
+                     f"v / t = {v:.2f} / {ex_sen:.2f} = {ex_prorate:.4f}"),
                     ("P(still employed at start of 2025)", "1.0000  (100% — no exits yet)"),
                     ("Exit rate in 2025",
                      f"Dismissal {q_f1:.1%} + Resignation {q_r1:.1%} + Death {q_d1:.4%} = {q_tot1:.4%}"),
                     ("Discount factor (mid-year, t = 0.5)",
                      f"{disc1:.5f}"),
                     ("DBO contribution from 2025",
-                     f"1.0000 × {q_tot1:.4%} × ₪{ex_ben:,.0f} × {disc1:.5f} ≈ ₪{ex_dbo:,.0f}"),
+                     f"1.0000 × (q_f×benefit + q_r×max(benefit,fund) + q_d×benefit) × {disc1:.5f} × {ex_prorate:.4f} ≈ ₪{ex_dbo:,.0f}"),
                 ]
             )}
           </table>
@@ -703,6 +751,7 @@ def main():
                 "Seniority at Exit":     cd["seniority"],
                 "Projected Salary (₪)":  cd["salary_proj"].map("{:,.0f}".format),
                 "Benefit if Exit (₪)":   cd["benefit"].map("{:,.0f}".format),
+                "Prorate (v/t)":         cd["prorate"].map("{:.4f}".format),
                 "P(Employed)":           cd["lp"].map("{:.4f}".format),
                 "Exit Rate":             (cd["q_dismissal"]+cd["q_resign"]+cd["q_death"]).map("{:.4f}".format),
                 "Discount Factor":       cd["disc_factor"].map("{:.4f}".format),
@@ -727,11 +776,13 @@ def main():
                         font-size:.78rem;color:#64748b;margin-top:.5rem">
               <strong>Column guide:</strong> &nbsp;
               <strong>Seniority at Exit</strong> — years of service if employee leaves that year &nbsp;|&nbsp;
-              <strong>Benefit if Exit</strong> — severance amount = Salary × Seniority × (1−Sec14%) &nbsp;|&nbsp;
+              <strong>Benefit if Exit</strong> — employer's severance obligation:
+                pre-Sec14 service at 100% + post-Sec14 service at (1−Sec14%) &nbsp;|&nbsp;
+              <strong>Prorate (v/t)</strong> — IAS 19 §67 past-service ratio: seniority at 31.12.24 ÷ seniority at exit &nbsp;|&nbsp;
               <strong>P(Employed)</strong> — probability employee is still working at the start of that year &nbsp;|&nbsp;
               <strong>Exit Rate</strong> — combined probability of leaving (dismissal + resignation + death) &nbsp;|&nbsp;
               <strong>Discount Factor</strong> — present-value weight for that year &nbsp;|&nbsp;
-              <strong>DBO This Year</strong> — P(Employed) × Exit Rate × Benefit × Discount Factor
+              <strong>DBO This Year</strong> — P(Employed) × Exit Rate × Benefit × Discount Factor × Prorate
             </div>
             """, unsafe_allow_html=True)
 
