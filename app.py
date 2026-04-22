@@ -43,6 +43,7 @@ def load_employees(path) -> pd.DataFrame:
             continue
 
         try:
+            emp_id = int(row.iloc[0]) if pd.notna(row.iloc[0]) else 0
             salary = float(row.iloc[6]) if pd.notna(row.iloc[6]) else 0.0
             pct_raw = _to_float(row.iloc[8])
             if pct_raw is None or (isinstance(pct_raw, float) and np.isnan(pct_raw)):
@@ -53,7 +54,7 @@ def load_employees(path) -> pd.DataFrame:
                 sec14_pct = pct_raw           # stored as fraction (e.g. 0.72 or 1.0)
             fund = float(row.iloc[9]) if pd.notna(row.iloc[9]) else 0.0
         except Exception:
-            salary, sec14_pct, fund = 0.0, 0.0, 0.0
+            emp_id, salary, sec14_pct, fund = 0, 0.0, 0.0, 0.0
 
         if salary <= 0:
             continue
@@ -65,6 +66,7 @@ def load_employees(path) -> pd.DataFrame:
             sec14_start = start_date
 
         records.append(dict(
+            emp_id        = emp_id,
             first_name    = str(row.iloc[1]) if pd.notna(row.iloc[1]) else "",
             last_name     = str(row.iloc[2]) if pd.notna(row.iloc[2]) else "",
             gender        = gender,
@@ -199,8 +201,15 @@ def calculate_dbo(emp: dict, curve, turns, sg, mort):
     v = years_between(start, VALUATION_DATE)  # seniority at valuation date
     n = int(W - x)
 
+    sec14_start = emp.get("sec14_start") or start
+    v_pre_base = max(0.0, years_between(start, sec14_start))
+
     if n <= 0:
-        b = salary * max(v, 0) * (1 - sec14)
+        sen_exit = max(v, 0.0)
+        v_pre = min(sen_exit, v_pre_base)
+        v_post = max(0.0, sen_exit - v_pre)
+        b = salary * (v_pre + v_post * (1 - sec14))
+            
         row = dict(year=0, age=round(x,1), seniority=round(v,2),
                    salary_proj=round(salary,2), lp=1.0,
                    q_dismissal=0.0, q_resign=0.0, q_death=0.0,
@@ -217,27 +226,31 @@ def calculate_dbo(emp: dict, curve, turns, sg, mort):
         sen_exit = v + t   # total seniority at projected exit
         sal_t    = salary * (1 + sg) ** t
 
-        # א. Projected benefit — current seniority v (prorating embedded in formula)
-        benefit = sal_t * v * (1 - sec14)
+        # א. Projected benefit — considering pre/post Section 14
+        v_pre = min(sen_exit, v_pre_base)
+        v_post = max(0.0, sen_exit - v_pre)
+        benefit_at_exit = sal_t * (v_pre + v_post * (1 - sec14))
+        prorate = v / sen_exit if sen_exit > 0 else 1.0
+        benefit_prorated = benefit_at_exit * prorate
 
         # ב. Exit probabilities
         q_f, q_r = turnover_for_age(age_t, turns)
         q_d      = mortality_for_age(age_t, gender, mort)
 
-        # ג. Employer payment probability
+        # ד. Present value
+        disc_mid = discount_factor(t - 0.5, curve)
+        
+        # ג. Employer payment probability (Standard IAS 19)
         q_pay = q_f + q_d                          # dismissal + death — always liable
         if sec14 == 0 and (v + t) >= 5:
             q_pay += q_r                           # resignation — only if no Sec14 & sen ≥ 5
         q_pay_r = q_r if (sec14 == 0 and (v + t) >= 5) else 0.0
-
-        # ד. Present value
-        disc_mid = discount_factor(t - 0.5, curve)
-        year_dbo = lp * q_pay * benefit * disc_mid
+        year_dbo = lp * q_pay * benefit_prorated * disc_mid
 
         # ה. Retirement (final year)
         if t == n:
             lp_ret    = lp * (1 - (q_f + q_r + q_d))
-            year_dbo += lp_ret * benefit * discount_factor(n, curve)
+            year_dbo += lp_ret * benefit_prorated * discount_factor(n, curve)
 
         dbo += year_dbo; cum += year_dbo
 
@@ -245,12 +258,12 @@ def calculate_dbo(emp: dict, curve, turns, sg, mort):
             year=t, age=age_t, seniority=round(sen_exit, 2),
             salary_proj=round(sal_t, 2), lp=round(lp, 5),
             q_dismissal=round(q_f, 4), q_resign=round(q_r, 4), q_death=round(q_d, 6),
-            benefit=round(benefit, 2), disc_factor=round(disc_mid, 5),
-            prorate=round(v / sen_exit, 4),
-            dbo_dismissal=round(lp * q_f  * benefit * disc_mid, 2),
-            dbo_resign   =round(lp * q_pay_r * benefit * disc_mid, 2),
-            dbo_death    =round(lp * q_d  * benefit * disc_mid, 2),
-            dbo_retirement=round(year_dbo - lp * q_pay * benefit * disc_mid, 2),
+            benefit=round(benefit_at_exit, 2), disc_factor=round(disc_mid, 5),
+            prorate=round(prorate, 4),
+            dbo_dismissal=round(lp * q_f  * benefit_prorated * disc_mid, 2),
+            dbo_resign   =round(lp * q_pay_r * benefit_prorated * disc_mid, 2),
+            dbo_death    =round(lp * q_d  * benefit_prorated * disc_mid, 2),
+            dbo_retirement=round(year_dbo - lp * q_pay * benefit_prorated * disc_mid, 2),
             year_dbo=round(year_dbo, 2), cum_dbo=round(cum, 2),
         ))
         lp *= (1 - (q_f + q_r + q_d))
@@ -444,14 +457,14 @@ def main():
             st.stop()
 
     @st.cache_data
-    def load_all():
+    def load_all_data():
         emps             = load_employees(data_path)
         curve, turns, sg = load_assumptions(data_path)
         mort             = load_mortality(mort_path)
         return emps, curve, turns, sg, mort
 
     with st.spinner("Loading files and running actuarial calculations…"):
-        df, curve, turns, sg, mort = load_all()
+        df, curve, turns, sg, mort = load_all_data()
 
     # ── Derive status fields ──────────────────────────────────
     df["age"]         = df["dob"].apply(lambda d: round(years_between(d, VALUATION_DATE), 1))
@@ -520,7 +533,7 @@ def main():
             return "None"
 
         table_df = pd.DataFrame({
-            "#":                  range(1, len(df)+1),
+            "Emp ID":             df["emp_id"],
             "First Name":         df["first_name"],
             "Last Name":          df["last_name"],
             "Gender":             df["gender"].map({"M": "Male", "F": "Female"}),
@@ -541,7 +554,7 @@ def main():
             use_container_width=True,
             height=500,
             column_config={
-                "#":               st.column_config.NumberColumn(width="small"),
+                "Emp ID":          st.column_config.NumberColumn(format="%d", width="small"),
                 "Age":             st.column_config.NumberColumn(format="%.1f", width="small"),
                 "Seniority (yrs)": st.column_config.NumberColumn(format="%.1f"),
                 "Monthly Salary":  st.column_config.NumberColumn(format="₪%d"),
