@@ -1,0 +1,101 @@
+# IAS19 Severance Pay Valuation System
+
+## Project Overview
+
+This project implements an actuarial valuation system for calculating the company’s severance pay liability in accordance with **IAS 19 – Employee Benefits**.
+
+The system calculates the expected severance obligation for each relevant employee as of the reporting date **31.12.2024**, using employee data, actuarial assumptions, discount rates, mortality tables, turnover probabilities, salary growth assumptions, Section 14 treatment, plan assets, and projected future payments.
+
+The goal of the project is to recreate a professional valuation process and generate a clear final output file that can be used for review, presentation, and comparison against benchmark results.
+
+---
+
+## Input Files
+
+The system is based on two main input files located in the `input` folder:
+
+### 1. `data10.xlsx`
+
+This file includes:
+
+- Employee personal data
+- Salary information
+- Employment start dates
+- Section 14 dates and percentages
+- Plan assets
+- Deposits
+- Termination data
+- Actuarial assumptions
+- Discount curve
+- Turnover assumptions
+- Salary growth assumption
+
+### 2. `mortality_table.xlsx`
+
+This file includes mortality tables by gender:
+
+- Male mortality table
+- Female mortality table
+
+The mortality rates are used to calculate the probability of death during the projection period.
+
+---
+
+## Output File
+
+The main output file is created in the `output` folder:
+
+### `results_ias19.xlsx`
+
+This file contains the final employee-level valuation table.
+
+The main sheet is:
+
+### `Employee Results`
+
+This sheet includes, for each employee:
+
+- Employee ID
+- Name
+- Gender
+- Birth date
+- Start date
+- Salary
+- Section 14 information
+- Plan asset
+- Deposits
+- Termination status
+- Age at valuation date
+- Service period
+- Retirement age used
+- Model assumptions applied
+- Final calculated IAS19 liability
+
+The main result column is:
+
+### `IAS19 Liability`
+
+This column represents the calculated present value of the severance pay obligation for each employee.
+
+---
+
+## Methodology
+
+The model calculates the expected present value of future severance payments by projecting possible future events year by year until retirement.
+
+The calculation considers:
+
+- Probability of dismissal
+- Probability of resignation
+- Probability of death
+- Retirement payment
+- Salary projection
+- Years of service
+- Section 14 coverage
+- Existing plan assets
+- Future deposits where relevant
+- Discounting based on the provided discount curve
+- Mortality rates by gender and age
+
+For each projection year, the model calculates the expected benefit payment and discounts it back to the valuation date.
+
