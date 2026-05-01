@@ -597,26 +597,29 @@ def calculate_liability(
             years_to_retirement,
         )
 
-        yearly_expected_payment = (
+        # Dismissal and mortality: mid-year discounting (t+0.5) per formula.
+        # Resignation and retirement: end-of-year discounting (t) per formula.
+        mid_year_period = year - 0.5
+        end_year_period = year
+
+        mid_year_payment = (
             dismissal_rate * benefits["dismissal_benefit"]
-            + resignation_rate * benefits["resignation_benefit"]
             + mortality_rate * benefits["death_benefit"]
         )
+        end_year_payment = resignation_rate * benefits["resignation_benefit"]
 
+        retirement_payment = 0
         if year == years_to_retirement:
             if effective_retirement_method == "full_retirement":
-                yearly_expected_payment += benefits["retirement_benefit"]
-
-            if effective_retirement_method == "retirement_with_remaining_probability":
+                retirement_payment = benefits["retirement_benefit"]
+            elif effective_retirement_method == "retirement_with_remaining_probability":
                 remaining_probability = max(0, 1 - dismissal_rate - resignation_rate - mortality_rate)
-                yearly_expected_payment += remaining_probability * benefits["retirement_benefit"]
+                retirement_payment = remaining_probability * benefits["retirement_benefit"]
 
-        if effective_discount_method == "mid_year_exit" and year != years_to_retirement:
-            discount_period = max(0.5, year - 0.5)
-        else:
-            discount_period = year
-
-        discounted_payment = survival_probability * yearly_expected_payment / ((1 + discount_rate) ** discount_period)
+        discounted_payment = survival_probability * (
+            mid_year_payment / ((1 + discount_rate) ** mid_year_period)
+            + (end_year_payment + retirement_payment) / ((1 + discount_rate) ** end_year_period)
+        )
         present_value += discounted_payment
 
         survival_probability *= max(0, 1 - dismissal_rate - resignation_rate - mortality_rate)
